@@ -1,56 +1,51 @@
-import org.apache.spark.ml.Pipeline
-import org.apache.spark.ml.feature._
-import org.apache.spark.ml.linalg.Vectors
-import org.apache.spark.ml.regression.GBTRegressor
-import org.apache.spark.ml.stat.Correlation
+import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.types.DoubleType
+import org.apache.spark.sql.functions._
+import regression.CreateModel
+
+import scala.util.{Failure, Success}
 
 object Main {
     def main(args: Array[String]) = {
-        val dataPath = "NewFiat.csv"
+        val dataPath = "UsedVolkswagen.csv"
 
         val spark = SparkSession.builder
             .appName("Car Price Regression")
             .config("spark.master", "local")
             .getOrCreate()
 
+        spark.sparkContext.setLogLevel("ERROR")
+
         val df = spark.read
             .option("header", true)
             .csv(dataPath)
+
+        val labelColumn = "Price"
 
         val columnsToIndex = Seq("Brand", "Model", "Production Year", "Fuel Type", "Transmission Type", "Class", "Color", "Country Of Origin",
             "Registered In Poland", "First Owner", "Without Accidents", "Certified Auto Repair Serviced", "Usage State",
             "Currency")
 
-        //val columnsToIndexWithDistinctRows = columnsToIndex.filter(column => df.select(column).distinct().count() > 1)
+        val columnsToCast   = df.columns.toSet -- columnsToIndex
+        val frameAfterCasts = columnsToCast.foldLeft(df)((frame, column) => frame.withColumn(column, df(column).cast(DoubleType)))
 
-        val indexAppendix  = " Index"
-        val vectorAppendix = " Vector"
+        val modelOption = CreateModel.generateModel(frameAfterCasts, columnsToIndex, labelColumn)
 
-        val Array(trainingData, testData) = df.randomSplit(Array(0.8, 0.2))
+        //This will evaluate the same dataset as the model was fitted on, thus may be prone to overfitting bias
+        val evaluator = new RegressionEvaluator()
+            .setLabelCol(labelColumn)
+            .setPredictionCol("Predicted " + labelColumn)
+            .setMetricName("rmse")
 
-        val indexers = columnsToIndex.map(column =>
-            new StringIndexer().setInputCol(column).setOutputCol(column + indexAppendix))
-
-        /*
-        val encoders = columnsToIndex.map(column =>
-            new OneHotEncoder().setInputCol(column + indexAppendix).setOutputCol(column + vectorAppendix))
-            .toArray
-        */
-
-        val featureColumns = (df.columns.toSet -- columnsToIndex - "Price" ++ columnsToIndex.map(_ + indexAppendix)).toSeq
-
-        val assembler = new VectorAssembler()
-            .setInputCols(featureColumns.toArray)
-            .setOutputCol("features")
-
-        val pipeline = new Pipeline().setStages((indexers).toArray)
-
-        val processed = pipeline.fit(df).transform(df).select("Price", featureColumns: _*)
-
-        processed.show()
-
-        processed.printSchema()
+        modelOption map (_.transform(frameAfterCasts).select("Predicted " + labelColumn, labelColumn, "features")) match {
+            case Success(predictions) => {
+                predictions.show()
+                println("RMSE: " + evaluator.evaluate(predictions))
+                frameAfterCasts.select(labelColumn).agg(avg(labelColumn).as("Average " + labelColumn)).show()
+            }
+            case Failure(error) => println("Failed! Error: " + error.getMessage)
+        }
 
         spark.stop()
     }
